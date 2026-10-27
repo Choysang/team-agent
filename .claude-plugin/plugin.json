@@ -1,0 +1,1 @@
+{ "name": "team-agent-router", "version": "3.1.0", "license": "MIT", "description": "Applies team-agent per-role model and effort to every Claude Code subagent dispatch, and records what each subagent actually ran on." }

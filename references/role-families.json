@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "description": "本机已审阅专业指令的职责分类；不是 Codex 官方内置角色表。保留专业指令，只共享模型配置。",
+  "groups": [
+    {
+      "id": "exploration", "label": "探索与资料检索", "default_profile": "Explorer",
+      "agents": ["code-explorer", "docs-lookup"],
+      "overrides": {"docs-lookup": "Researcher"}
+    },
+    {
+      "id": "planning", "label": "规划与架构设计", "default_profile": "ExpertAdvisor",
+      "agents": ["architect", "code-architect", "gan-planner", "planner"]
+    },
+    {
+      "id": "implementation", "label": "实现、构建修复与优化", "default_profile": "Executor",
+      "agents": ["build-error-resolver", "cpp-build-resolver", "dart-build-resolver", "go-build-resolver", "java-build-resolver", "kotlin-build-resolver", "pytorch-build-resolver", "rust-build-resolver", "gan-generator", "code-simplifier", "refactor-cleaner", "performance-optimizer", "harness-optimizer"]
+    },
+    {
+      "id": "review", "label": "静态审查与风险核验", "default_profile": "Reviewer",
+      "agents": ["code-reviewer", "cpp-reviewer", "csharp-reviewer", "database-reviewer", "flutter-reviewer", "go-reviewer", "healthcare-reviewer", "java-reviewer", "kotlin-reviewer", "python-reviewer", "rust-reviewer", "security-reviewer", "typescript-reviewer", "comment-analyzer", "pr-test-analyzer", "silent-failure-hunter", "type-design-analyzer", "opensource-sanitizer", "seo-specialist"]
+    },
+    {
+      "id": "testing", "label": "测试编写、执行与评估", "default_profile": "Executor",
+      "agents": ["e2e-runner", "tdd-guide", "gan-evaluator"],
+      "overrides": {"gan-evaluator": "Reviewer"}
+    },
+    {
+      "id": "publishing", "label": "文档与开源交付", "default_profile": "Executor",
+      "agents": ["doc-updater", "opensource-forker", "opensource-packager"]
+    },
+    {
+      "id": "operations", "label": "业务运营与任务运行", "default_profile": "GeneralWorker",
+      "agents": ["chief-of-staff", "loop-operator"]
+    },
+    {
+      "id": "retrospective", "label": "对话与流程复盘", "default_profile": "GeneralWorker",
+      "agents": ["conversation-analyzer"]
+    }
+  ]
+}
