@@ -1,4 +1,4 @@
-"""Opt-in, model-scoped Codex context metadata; never rewrite global limits."""
+"""Inspect native Codex context and retire legacy static-catalog overrides."""
 from __future__ import annotations
 
 from copy import deepcopy
@@ -52,17 +52,6 @@ def _unmanaged_text(text: str) -> tuple[str, bool]:
     raise ValueError("incomplete managed context catalog header")
 
 
-def _check_pointer(config: dict, managed: bool, catalog_path: Path, active: bool) -> None:
-    pointer = config.get("model_catalog_json")
-    if active:
-        if not managed or not isinstance(pointer, str) or Path(pointer).resolve() != catalog_path.resolve():
-            raise ValueError("managed context catalog is no longer selected; reconcile config before updating")
-    elif managed or pointer is not None:
-        raise ValueError("existing model_catalog_json needs reconciliation; it was not overwritten")
-    if "model_context_window" in config:
-        raise ValueError("global model_context_window would override model-scoped settings; it was not changed")
-
-
 def _base(codex_home: Path) -> dict:
     payload = json.loads((codex_home / "models_cache.json").read_text(encoding="utf-8"))
     if not isinstance(payload, dict) or not isinstance(payload.get("models"), list):
@@ -75,124 +64,103 @@ def _base(codex_home: Path) -> dict:
     return {"models": models}
 
 
-def render(codex_home: Path, overrides: dict[str, int]) -> dict:
-    catalog = deepcopy(_base(codex_home))
-    models = {item["slug"]: item for item in catalog["models"]}
-    for slug, window in overrides.items():
-        if slug not in models:
-            raise ValueError(f"configured context model is absent from current catalog: {slug}")
-        model = models[slug]
-        maximum = model.get("max_context_window")
-        if not _positive(maximum):
-            maximum = model.get("context_window")
-        if not _positive(window) or not _positive(maximum) or window > maximum:
-            raise ValueError(f"window for {slug} must be a positive integer within its catalog limit {maximum}")
-        model["context_window"] = window
-    return catalog
-
-
 def _json_bytes(value: dict) -> bytes:
     return (json.dumps(value, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
 
 
-def refresh(state_dir: Path, codex_home: Path) -> dict:
-    """Rebase explicit overrides on the current catalog without freezing other models."""
-    state = _state(state_dir, codex_home)
-    if not state["models"]:
-        return {"status": "default", "changed": False}
-    _, text, config = _config(codex_home)
-    _, managed = _unmanaged_text(text)
+def _retirement_outputs(state_dir: Path, codex_home: Path) -> dict[Path, bytes]:
+    original, text, config = _config(codex_home)
+    base_text, managed = _unmanaged_text(text)
     _, catalog_path = _paths(state_dir)
-    _check_pointer(config, managed, catalog_path, True)
-    content = _json_bytes(render(codex_home, state["models"]))
-    changed = not catalog_path.exists() or catalog_path.read_bytes() != content
-    if changed:
-        from team_adapter import commit_files
-        commit_files({catalog_path: content}, state_dir)
-    return {"status": "configured", "changed": changed, "startup_only": True}
+    pointer = config.get("model_catalog_json")
+    if pointer is not None and (
+        not managed or not isinstance(pointer, str)
+        or Path(pointer).resolve() != catalog_path.resolve()
+    ):
+        raise ValueError("unmanaged model_catalog_json was preserved; reconcile it before retirement")
+    if managed and "model_catalog_json" in tomllib.loads(base_text):
+        raise ValueError("model_catalog_json outside the managed header was preserved")
+    if not managed:
+        return {}
+    encoding = "utf-8-sig" if original.startswith(b"\xef\xbb\xbf") else "utf-8"
+    return {codex_home / "config.toml": base_text.encode(encoding)}
+
+
+def retire(state_dir: Path, codex_home: Path) -> dict:
+    """Explicitly remove only our legacy pointer, retaining saved preferences."""
+    outputs = _retirement_outputs(state_dir, codex_home)
+    from team_adapter import commit_files
+    backups = commit_files(outputs, state_dir) if outputs else []
+    return {"status": "inactive" if _paths(state_dir)[0].exists() else "default",
+            "changed": bool(outputs), "model_discovery": "native",
+            "stored_preferences_retained": True, "restart_required": bool(outputs),
+            "backup_files": backups}
 
 
 def configure(state_dir: Path, codex_home: Path, model: str, window: int | None) -> dict:
+    if window is not None:
+        return {"status": "unsupported", "model": model,
+                "requested_context_window": window, "host_settings_changed": False,
+                "reason": "static_model_catalog_disables_remote_model_discovery",
+                "alternative": "keep_native_model_catalog_and_context_defaults"}
     state = _state(state_dir, codex_home)
-    if window is None and model not in state["models"]:
+    if model not in state["models"]:
         return {"status": "default", "changed": False}
-    original, text, config = _config(codex_home)
-    base_text, managed = _unmanaged_text(text)
-    state_path, catalog_path = _paths(state_dir)
-    _check_pointer(config, managed, catalog_path, bool(state["models"]))
     updated = deepcopy(state)
-    if window is None:
-        updated["models"].pop(model)
-    else:
-        updated["models"][model] = window
-    catalog = render(codex_home, updated["models"]) if updated["models"] else None
-    newline = "\r\n" if "\r\n" in text else "\n"
-    header = ""
-    if updated["models"]:
-        header = newline.join([START,
-            "model_catalog_json = " + json.dumps(catalog_path.resolve().as_posix(), ensure_ascii=False),
-            END, ""])
-    rewritten = header + base_text
-    tomllib.loads(rewritten)
-    encoding = "utf-8-sig" if original.startswith(b"\xef\xbb\xbf") else "utf-8"
+    updated["models"].pop(model)
+    outputs = _retirement_outputs(state_dir, codex_home)
+    retired = bool(outputs)
+    state_path, _ = _paths(state_dir)
+    outputs[state_path] = _json_bytes(updated)
     from team_adapter import commit_files
-    outputs = {codex_home / "config.toml": rewritten.encode(encoding),
-               state_path: _json_bytes(updated)}
-    if catalog is not None:
-        outputs = {catalog_path: _json_bytes(catalog), **outputs}
-    changed = any(not p.exists() or p.read_bytes() != data for p, data in outputs.items())
     backups = commit_files(outputs, state_dir)
-    return {"status": "configured" if updated["models"] else "default", "changed": changed,
-            "model": model, "requested_context_window": window,
-            "scope": "host_model_catalog_including_root_and_subagent_sessions",
-            "startup_only": True, "runtime_status": "unverified", "backup_files": backups}
+    return {"status": "inactive" if updated["models"] else "default",
+            "changed": True, "model": model, "requested_context_window": None,
+            "model_discovery": "native", "retired_shared_catalog": retired,
+            "remaining_preferences_inactive": sorted(updated["models"]),
+            "restart_required": retired, "backup_files": backups}
 
 
 def report(state_dir: Path, codex_home: Path, model: str | None = None) -> dict:
-    state = _state(state_dir, codex_home)
-    _, text, config = _config(codex_home)
-    _, managed = _unmanaged_text(text)
-    _, catalog_path = _paths(state_dir)
     issues = []
     try:
-        _check_pointer(config, managed, catalog_path, bool(state["models"]))
+        state = _state(state_dir, codex_home)
+    except (OSError, ValueError) as error:
+        state = {"models": {}}
+        issues.append(f"legacy context preferences were not applied: {error}")
+    _, text, config = _config(codex_home)
+    try:
+        _, managed = _unmanaged_text(text)
     except ValueError as error:
-        issues.append(str(error))
+        managed = False
+        issues.append(f"legacy context header needs repair: {error}")
+    pointer = config.get("model_catalog_json")
+    if pointer is not None:
+        issues.append("model_catalog_json disables remote model discovery")
+    if "model_context_window" in config:
+        issues.append("global model_context_window is not a per-model override")
     rows = []
     for item in _base(codex_home)["models"]:
         slug = item["slug"]
         if model is not None and slug != model:
             continue
-        window = state["models"].get(slug, item.get("context_window"))
+        window = item.get("context_window") if pointer is None else None
         percent = item.get("effective_context_window_percent")
         estimate = window * percent // 100 if _positive(window) and _positive(percent) and percent <= 100 else None
         rows.append({"model": slug, "catalog_default_window": item.get("context_window"),
                      "catalog_maximum_window": item.get("max_context_window"),
-                     "configured_window": state["models"].get(slug),
-                     "effective_window_estimate": estimate,
+                     "requested_window": state["models"].get(slug),
+                     "configured_window": None, "effective_window_estimate": estimate,
                      "estimate_source": "catalog_metadata_not_runtime_telemetry"})
     if model is not None and not rows:
         raise ValueError(f"unknown model: {model}")
-    recommendations = []
-    if not issues:
-        for row in rows:
-            current = row["configured_window"] or row["catalog_default_window"]
-            maximum = row["catalog_maximum_window"]
-            if (row["model"] == "gpt-6-luna" and _positive(current) and current < 800000
-                    and _positive(maximum) and maximum >= 800000):
-                recommendations.append({
-                    "id": "luna_context_800k", "model": "gpt-6-luna",
-                    "current_configured_window": current, "suggested_window": 800000,
-                    "scope": "host_model_root_and_subagent_sessions",
-                    "requires_user_selection": True,
-                    "reason": "more_context_space_for_long_tasks_not_guaranteed_quality_improvement",
-                    "evidence": "host_configuration_and_catalog_not_live_thread",
-                })
-    return {"status": "needs_reconciliation" if issues else "configured" if state["models"] else "default",
-            "scope": "per_model_startup_catalog_not_per_role_spawn_parameter",
-            "subagent_window_override_supported": False,
-            "host_model_override_scope": "root_and_subagent_sessions_using_the_model",
-            "automatic_prompt": bool(recommendations), "recommendations": recommendations,
+    status = ("legacy_static_catalog" if managed else "external_catalog") if pointer is not None else (
+        "inactive" if state["models"] else "default")
+    return {"status": status, "scope": "native_model_catalog",
+            "subagent_window_override_supported": False, "per_model_override_supported": False,
+            "host_model_override_scope": None, "automatic_prompt": False, "recommendations": [],
+            "blocks_remote_model_discovery": pointer is not None,
+            "migration_command": "context-retire" if managed else None,
             "global_context_window": config.get("model_context_window"),
             "global_auto_compact_token_limit": config.get("model_auto_compact_token_limit"),
             "models": rows, "issues": issues, "startup_only": True,

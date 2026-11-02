@@ -1493,6 +1493,7 @@ def build_parser() -> argparse.ArgumentParser:
     context_set.add_argument("--scope", choices=["subagent", "host-model"], default="subagent")
     context_reset = command_parser("context-reset")
     context_reset.add_argument("--model", required=True)
+    command_parser("context-retire")
     log = command_parser("log")
     log.add_argument("--role", required=True)
     log.add_argument("--model", required=True)
@@ -1510,9 +1511,6 @@ def build_parser() -> argparse.ArgumentParser:
 def _run_command(args: argparse.Namespace, state_dir: Path, codex_home: Path) -> int:
     global CATALOG_NOTICE
     try:
-        from model_context import refresh as refresh_context
-        if args.command not in {"context-set", "context-reset", "preference"}:
-            refresh_context(state_dir, codex_home)
         CATALOG_NOTICE = (
             None if args.command == "preference"
             else check_catalog(state_dir, codex_home)
@@ -1523,6 +1521,10 @@ def _run_command(args: argparse.Namespace, state_dir: Path, codex_home: Path) ->
                 if args.dispatch_models is not None else None
             )
             return cmd_models(codex_home, state_dir, dispatch_models)
+        if args.command == "context-retire":
+            from model_context import retire
+            emit(retire(state_dir, codex_home))
+            return 0
         if args.command in {"context-set", "context-reset"}:
             if args.command == "context-set" and args.scope != "host-model":
                 emit({"status": "unsupported", "scope": "subagent",
@@ -1531,9 +1533,10 @@ def _run_command(args: argparse.Namespace, state_dir: Path, codex_home: Path) ->
                       "host_settings_changed": False})
                 return 1
             from model_context import configure
-            emit(configure(state_dir, codex_home, args.model,
-                           args.window if args.command == "context-set" else None))
-            return 0
+            result = configure(state_dir, codex_home, args.model,
+                               args.window if args.command == "context-set" else None)
+            emit(result)
+            return 1 if result["status"] == "unsupported" else 0
         if args.command == "context":
             from model_context import report, observe
             result = report(state_dir, codex_home, args.model)

@@ -51,6 +51,90 @@ class ContextTests(unittest.TestCase):
         self.assertEqual(result.stderr, "")
         return result.returncode, json.loads(result.stdout)
 
+    def legacy_catalog(self, *, active: bool = True) -> None:
+        self.state.mkdir(exist_ok=True)
+        (self.state / "context-overrides.json").write_text(json.dumps({
+            "schema_version": 1, "codex_home": str(self.host.resolve()),
+            "models": {"luna": 800000},
+        }), encoding="utf8")
+        old = deepcopy(self.models)
+        old[0]["context_window"] = 800000
+        (self.state / "context-models.json").write_text(json.dumps({"models": old}), encoding="utf8")
+        pointer = 'model_catalog_json = ' + json.dumps((self.state / "context-models.json").as_posix())
+        header = '# team-agent context catalog:start\r\n' + ('' if active else '#') + pointer + '\r\n# team-agent context catalog:end\r\n'
+        (self.host / "config.toml").write_bytes(b'\xef\xbb\xbf' + header.encode() + self.original[3:])
+
+    def test_disabled_legacy_catalog_does_not_block_new_model_discovery(self) -> None:
+        self.legacy_catalog(active=False)
+        before = (self.host / "config.toml").read_bytes()
+        self.models.append({**deepcopy(self.models[1]), "slug": "gpt-6.1-terra"})
+        self.cache()
+        code, data = self.run_cli("models", "--dispatch-models", "gpt-6.1-terra")
+        self.assertEqual(code, 0, data)
+        self.assertIn("gpt-6.1-terra", [row["slug"] for row in data["models"]])
+        self.assertEqual((self.host / "config.toml").read_bytes(), before)
+
+    def test_read_commands_do_not_rewrite_or_reactivate_legacy_catalogs(self) -> None:
+        self.legacy_catalog()
+        catalog_path = self.state / "context-models.json"
+        before = catalog_path.read_bytes()
+        self.models.append({**deepcopy(self.models[1]), "slug": "gpt-6.1-terra"})
+        self.cache()
+        code, data = self.run_cli("context")
+        self.assertEqual(code, 0, data)
+        self.assertEqual(catalog_path.read_bytes(), before)
+        self.assertEqual(data["status"], "legacy_static_catalog")
+        self.assertTrue(data["blocks_remote_model_discovery"])
+
+    def test_saved_window_is_not_reported_as_active_after_pointer_is_disabled(self) -> None:
+        self.legacy_catalog(active=False)
+        code, data = self.run_cli("context", "--model", "luna")
+        self.assertEqual(code, 0, data)
+        self.assertEqual(data["status"], "inactive")
+        self.assertEqual(data["models"][0]["requested_window"], 800000)
+        self.assertIsNone(data["models"][0]["configured_window"])
+        self.assertEqual(data["models"][0]["effective_window_estimate"], 258400)
+
+    def test_unreadable_legacy_preferences_do_not_block_native_model_listing(self) -> None:
+        self.legacy_catalog(active=False)
+        state = self.state / "context-overrides.json"
+        state.write_text("{broken", encoding="utf8")
+        for command in ("models", "onboarding"):
+            code, data = self.run_cli(command)
+            self.assertEqual(code, 0, data)
+            self.assertTrue(data["context"]["issues"])
+            self.assertEqual(state.read_text(encoding="utf8"), "{broken")
+
+    def test_retirement_does_not_need_readable_legacy_preferences(self) -> None:
+        self.legacy_catalog()
+        state = self.state / "context-overrides.json"
+        state.write_text("{broken", encoding="utf8")
+        code, data = self.run_cli("context-retire")
+        self.assertEqual(code, 0, data)
+        self.assertEqual((self.host / "config.toml").read_bytes(), self.original)
+        self.assertEqual(state.read_text(encoding="utf8"), "{broken")
+
+    def test_broken_legacy_header_does_not_block_read_only_commands(self) -> None:
+        self.legacy_catalog(active=False)
+        config_path = self.host / "config.toml"
+        text = config_path.read_text(encoding="utf-8-sig").replace('# team-agent context catalog:end', '# missing end')
+        config_path.write_text(text, encoding="utf8")
+        from team_adapter import ROLE_NAMES
+        profile = {"schema_version": 2, "roles": {
+            name: {"model": "luna", "effort": "max", "fallbacks": [], "active_index": 0}
+            for name in ROLE_NAMES
+        }}
+        (self.state / "profile.json").write_text(json.dumps(profile), encoding="utf8")
+        before = config_path.read_bytes()
+        for args in (("models",), ("onboarding",), ("resolve", "--role", "Explorer")):
+            code, data = self.run_cli(*args)
+            self.assertEqual(code, 0, data)
+            self.assertTrue(data["context"]["issues"])
+            self.assertEqual(config_path.read_bytes(), before)
+        code, data = self.run_cli("context-retire")
+        self.assertEqual(code, 1, data)
+        self.assertEqual(config_path.read_bytes(), before)
+
     def test_default_does_not_create_context_settings(self) -> None:
         code, data = self.run_cli("context")
         self.assertEqual(code, 0, data)
@@ -69,29 +153,25 @@ class ContextTests(unittest.TestCase):
             self.assertEqual((self.host / "config.toml").read_bytes(), self.original)
             self.assertFalse((self.state / "context-overrides.json").exists())
 
-    def test_luna_notice_is_a_host_scope_suggestion_without_config_write(self) -> None:
+    def test_luna_does_not_offer_unsupported_static_catalog_activation(self) -> None:
         self.models[0]["slug"] = "gpt-6-luna"
         self.cache()
         code, data = self.run_cli("onboarding", "--dispatch-models", "gpt-6-luna")
         self.assertEqual(code, 0, data)
-        suggestions = data["context"]["recommendations"]
-        self.assertEqual(len(suggestions), 1)
-        self.assertEqual(suggestions[0]["suggested_window"], 800000)
-        self.assertEqual(suggestions[0]["current_configured_window"], 272000)
-        self.assertEqual(suggestions[0]["scope"], "host_model_root_and_subagent_sessions")
-        self.assertTrue(suggestions[0]["requires_user_selection"])
+        self.assertEqual(data["context"]["recommendations"], [])
+        self.assertFalse(data["context"]["per_model_override_supported"])
         self.assertEqual((self.host / "config.toml").read_bytes(), self.original)
         self.assertFalse((self.state / "context-overrides.json").exists())
 
-    def test_luna_notice_disappears_after_explicit_host_configuration(self) -> None:
-        self.models[0]["slug"] = "gpt-6-luna"
-        self.cache()
-        code, data = self.run_cli("context-set", "--scope", "host-model", "--model", "gpt-6-luna", "--window", "800000")
-        self.assertEqual(code, 0, data)
-        _, data = self.run_cli("context", "--model", "gpt-6-luna")
-        self.assertEqual(data["recommendations"], [])
-        self.assertFalse(data["automatic_prompt"])
-        self.assertEqual(data["runtime_status"], "unverified_without_thread_telemetry")
+    def test_host_scope_cannot_enable_static_catalog_even_with_explicit_window(self) -> None:
+        code, data = self.run_cli("context-set", "--scope", "host-model", "--model", "luna", "--window", "800000")
+        self.assertEqual(code, 1, data)
+        self.assertEqual(data["status"], "unsupported")
+        self.assertEqual(data["reason"], "static_model_catalog_disables_remote_model_discovery")
+        self.assertFalse(data["host_settings_changed"])
+        self.assertEqual((self.host / "config.toml").read_bytes(), self.original)
+        self.assertFalse((self.state / "context-models.json").exists())
+        self.assertFalse((self.state / "context-overrides.json").exists())
 
     def test_luna_notice_requires_known_sufficient_limit_and_smaller_window(self) -> None:
         self.models[0]["slug"] = "gpt-6-luna"
@@ -133,40 +213,37 @@ class ContextTests(unittest.TestCase):
         self.assertEqual(data["first_use_check"]["selectable_models"], [])
         self.assertTrue(all(item["dispatch_supported"] is None for item in data["models"]))
 
-    def test_only_requested_model_changes_and_reset_restores_config_bytes(self) -> None:
-        code, data = self.run_cli("context-set", "--scope", "host-model", "--model", "luna", "--window", "800000")
+    def test_retirement_restores_only_managed_config_and_keeps_preferences(self) -> None:
+        self.legacy_catalog()
+        state_path = self.state / "context-overrides.json"
+        saved = state_path.read_bytes()
+        cache_before = (self.host / "models_cache.json").read_bytes()
+        code, data = self.run_cli("context-retire")
         self.assertEqual(code, 0, data)
-        expected = deepcopy(self.models)
-        expected[0]["context_window"] = 800000
-        catalog = json.loads((self.state / "context-models.json").read_text(encoding="utf8"))
-        self.assertEqual(catalog["models"], expected)
-        self.assertEqual(json.loads((self.host / "models_cache.json").read_text(encoding="utf8"))["models"], self.models)
-        config = tomllib.loads((self.host / "config.toml").read_text(encoding="utf-8-sig"))
-        self.assertNotIn("model_context_window", config)
-        self.assertNotIn("model_auto_compact_token_limit", config)
-        self.assertEqual(config["agents"], {"default_subagent_model": "parent"})
-        _, report = self.run_cli("context", "--model", "luna")
-        self.assertEqual(report["models"][0]["effective_window_estimate"], 760000)
-        code, reset = self.run_cli("context-reset", "--model", "luna")
-        self.assertEqual(code, 0, reset)
+        self.assertTrue(data["changed"])
+        self.assertTrue(data["stored_preferences_retained"])
         self.assertEqual((self.host / "config.toml").read_bytes(), self.original)
+        self.assertEqual(state_path.read_bytes(), saved)
+        self.assertEqual((self.host / "models_cache.json").read_bytes(), cache_before)
+        code, repeated = self.run_cli("context-retire")
+        self.assertEqual(code, 0, repeated)
+        self.assertFalse(repeated["changed"])
 
-    def test_refresh_keeps_other_models_current_and_does_not_drop_new_models(self) -> None:
-        self.run_cli("context-set", "--scope", "host-model", "--model", "luna", "--window", "800000")
+    def test_native_cache_updates_visible_without_context_writes(self) -> None:
+        self.legacy_catalog(active=False)
+        old_catalog = (self.state / "context-models.json").read_bytes()
         self.models[1]["context_window"] = 600000
-        added = deepcopy(self.models[1])
-        added["slug"] = "new-model"
-        self.models.append(added)
+        self.models.append({**deepcopy(self.models[1]), "slug": "gpt-6.1-terra"})
         self.cache()
         code, data = self.run_cli("context")
         self.assertEqual(code, 0, data)
-        actual = json.loads((self.state / "context-models.json").read_text(encoding="utf8"))["models"]
-        expected = deepcopy(self.models)
-        expected[0]["context_window"] = 800000
-        self.assertEqual(actual, expected)
+        rows = {item["model"]: item for item in data["models"]}
+        self.assertEqual(rows["sol"]["catalog_default_window"], 600000)
+        self.assertIn("gpt-6.1-terra", rows)
+        self.assertEqual((self.state / "context-models.json").read_bytes(), old_catalog)
 
     def test_reset_last_override_does_not_require_a_model_cache(self) -> None:
-        self.run_cli("context-set", "--scope", "host-model", "--model", "luna", "--window", "800000")
+        self.legacy_catalog()
         (self.host / "models_cache.json").unlink()
         code, data = self.run_cli("context-reset", "--model", "luna")
         self.assertEqual(code, 0, data)
@@ -189,14 +266,45 @@ class ContextTests(unittest.TestCase):
                 self.assertNotEqual(code, 0, data)
                 self.assertEqual((self.host / "config.toml").read_bytes(), original)
 
-    def test_setting_one_model_does_not_erase_another_override(self) -> None:
-        self.run_cli("context-set", "--scope", "host-model", "--model", "luna", "--window", "800000")
-        code, data = self.run_cli("context-set", "--scope", "host-model", "--model", "sol", "--window", "700000")
+    def test_reset_preserves_other_saved_preferences_without_reactivating_catalog(self) -> None:
+        self.legacy_catalog()
+        p = self.state / "context-overrides.json"
+        state = json.loads(p.read_text(encoding="utf8"))
+        state["models"]["sol"] = 700000
+        p.write_text(json.dumps(state), encoding="utf8")
+        code, data = self.run_cli("context-reset", "--model", "luna")
         self.assertEqual(code, 0, data)
-        self.run_cli("context-reset", "--model", "luna")
-        state = json.loads((self.state / "context-overrides.json").read_text(encoding="utf8"))
-        self.assertEqual(state["models"], {"sol": 700000})
-        self.assertIn("model_catalog_json", tomllib.loads((self.host / "config.toml").read_text(encoding="utf-8-sig")))
+        self.assertEqual(json.loads(p.read_text(encoding="utf8"))["models"], {"sol": 700000})
+        self.assertEqual(data["remaining_preferences_inactive"], ["sol"])
+        self.assertEqual((self.host / "config.toml").read_bytes(), self.original)
+
+    def test_retirement_never_removes_a_manual_catalog(self) -> None:
+        self.legacy_catalog()
+        custom = b'model_catalog_json = "manual.json"\n'
+        (self.host / "config.toml").write_bytes(custom)
+        saved = (self.state / "context-overrides.json").read_bytes()
+        code, data = self.run_cli("context-retire")
+        self.assertEqual(code, 1, data)
+        self.assertEqual((self.host / "config.toml").read_bytes(), custom)
+        self.assertEqual((self.state / "context-overrides.json").read_bytes(), saved)
+
+    def test_retirement_of_commented_pointer_never_reenables_it(self) -> None:
+        self.legacy_catalog(active=False)
+        code, data = self.run_cli("context-retire")
+        self.assertEqual(code, 0, data)
+        self.assertEqual((self.host / "config.toml").read_bytes(), self.original)
+
+    def test_retirement_refuses_a_matching_pointer_outside_the_managed_header(self) -> None:
+        self.legacy_catalog(active=False)
+        config_path = self.host / "config.toml"
+        text = config_path.read_text(encoding="utf-8-sig")
+        outside = 'model_catalog_json = ' + json.dumps((self.state / "context-models.json").as_posix()) + '\n'
+        text = text.replace('# keep this comment', outside + '# keep this comment')
+        config_path.write_text(text, encoding="utf-8")
+        before = config_path.read_bytes()
+        code, data = self.run_cli("context-retire")
+        self.assertEqual(code, 1, data)
+        self.assertEqual(config_path.read_bytes(), before)
 
     def telemetry(self, events: list[dict]) -> None:
         path = self.host / "sessions" / "probe.jsonl"

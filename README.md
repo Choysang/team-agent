@@ -84,6 +84,10 @@ claude plugin test .
 
 设计吸收了这些项目的经验：[oil-oil/codex](https://github.com/oil-oil/codex)（委托与复核方法）、[obra/superpowers](https://github.com/obra/superpowers)（子代理状态与审查）、[Anthropic advisor strategy](https://claude.com/blog/the-advisor-strategy)（按需动用强模型）、[youngbinkim0/opencode-fallback](https://github.com/youngbinkim0/opencode-fallback)（错误分类与冷却）、[code-yeongyu/oh-my-openagent](https://github.com/code-yeongyu/oh-my-openagent)（按代理的备选链）、[musistudio/claude-code-router](https://github.com/musistudio/claude-code-router) 与 [tzachbon/claude-model-router-hook](https://github.com/tzachbon/claude-model-router-hook)（模型路由方式对比）。技能结构按 [oil-oil/oil-skill-creator](https://github.com/oil-oil/oil-skill-creator) 的规范整理。
 
+## 维护记录
+
+- 2026-11-02（3.5.1）：修复 Codex 新模型被旧上下文目录屏蔽的问题。退役静态模型目录覆盖及自动刷新；注释配置或旧偏好损坏不再阻塞模型发现与角色解析。新增 `context-retire`，备份清理受管目录指针，保留个人模型选择与未生效的窗口偏好。
+
 ## 许可证
 
 MIT

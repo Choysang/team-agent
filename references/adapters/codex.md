@@ -70,7 +70,7 @@ bind_roles保留已有专用指令，按职能绑定本机专用角色模型。�
 
 用户明确要求切换父会话Fast时才使用宿主原生UI或CLI的 /fast，并说明同父会话子代理共同继承。不能改模型目录默认服务档位冒充独立子代理支持；目录声明能力不证明账号可用、实际开启或计费倍率。
 
-当前独立子代理窗口不支持；按模型的宿主覆盖与调试见 [Codex上下文](../context-settings.md)。仅在处理该功能时读取；Luna800k建议另按 [模型特例](../model-policies.md) 匹配，不将其作为所有模型默认值。
+当前独立子代理窗口不支持；上下文诊断与旧静态目录退役见 [Codex上下文](../context-settings.md)。仅在处理该功能时读取；Luna800k旧偏好的暂停状态另按 [模型特例](../model-policies.md) 匹配，不将其作为所有模型默认值。
 
 子代理继承父会话权限、provider和MCP。外部API/CC Switch的发现和切换边界见 [服务商发现](provider-discovery.md)。不能在子代理TOML中为各角色独立切provider。
 

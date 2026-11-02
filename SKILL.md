@@ -4,7 +4,7 @@ description: 让子代理按职能使用用户指定的模型、思考强度与�
 license: MIT
 compatibility: 依赖宿主的子代理能力，按宿主分别适配（适配卡在references/adapters，通用判定法在generic.md，删除任一宿主卡不影响其他宿主）。已实测Claude Code（Linux云端与Windows桌面）、Codex（Windows桌面）与Antigravity（Windows桌面）；Qoder、CodeBuddy核对过本机文件；Gemini CLI、Cursor、Copilot、OpenCode仅依据文档；Kimi Code不支持子代理单独设模型。脚本为可选加速器，需Python 3.10+标准库（Codex与Claude Code适配器需3.11+），没有Python时按卡手工写入。因产品本身就是宿主适配，校验时不使用--universal。
 metadata:
-  version: "3.5.0"
+  version: "3.5.1"
 ---
 
 # Team Agent
@@ -15,6 +15,7 @@ metadata:
 
 - 全程由你（当前Agent）执行：识别、读取、提问、写文件、验证、汇报都用你自己的工具完成。不要把命令交给用户去跑；只有宿主仅能在图形界面里设置的项，才给出准确的点击路径。
 - 用户只做两件事：回答选择卡，以及批准敏感写入（插件、全局设置、环境变量、改写本技能的适配卡）。写入被拒时说明原因，改用该宿主卡中的降级方案，不绕过。
+- 保留宿主模型目录的更新能力：附加设置不得用静态完整列表替代原生发现；旧偏好与当前生效值分开报告。
 - 不编造能力：宿主不支持的维度显示“不支持”或“继承”，不补造选项；配置写入、宿主加载、实际调用匹配分开验证，自报型号不作证据。
 - 只改受管内容：用标记块或带生成标记的文件，块外和用户原有字段保持不变；改前备份到 `~/.team-agent/backups/<宿主ID>/`。
 
