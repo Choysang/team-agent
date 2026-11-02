@@ -242,6 +242,50 @@ class ContextTests(unittest.TestCase):
         self.assertIn("gpt-6.1-terra", rows)
         self.assertEqual((self.state / "context-models.json").read_bytes(), old_catalog)
 
+    def test_successive_unseen_models_remain_visible_without_reconfiguration(self) -> None:
+        self.legacy_catalog(active=False)
+        from team_adapter import ROLE_NAMES
+        profile = {"schema_version": 2, "skip_fallback_prompts": False, "roles": {
+            name: {"model": "luna", "effort": "max", "fallbacks": [], "active_index": 0}
+            for name in ROLE_NAMES
+        }}
+        profile_path = self.state / "profile.json"
+        profile_path.write_text(json.dumps(profile), encoding="utf8")
+        preserved = {path: path.read_bytes() for path in (
+            self.host / "config.toml", self.state / "context-models.json", profile_path,
+        )}
+        code, baseline = self.run_cli("models")
+        self.assertEqual(code, 0, baseline)
+        self.assertEqual(baseline["catalog_notice"]["status"], "baseline_established")
+
+        # Arbitrary identifiers exercise future releases, without a Terra exception.
+        for slug in ("unseen-release-one", "unseen-release-two"):
+            self.models.append({**deepcopy(self.models[1]), "slug": slug})
+            self.cache()
+            cache_bytes = (self.host / "models_cache.json").read_bytes()
+            dispatch_slugs = {item["slug"] for item in self.models if item["slug"] != "sol"}
+            dispatch = ",".join(sorted(dispatch_slugs | {"dispatch-only-id"}))
+            code, listing = self.run_cli("models", "--dispatch-models", dispatch)
+            self.assertEqual(code, 0, listing)
+            self.assertEqual([item["slug"] for item in listing["models"]],
+                             [item["slug"] for item in self.models])
+            self.assertTrue(next(item for item in listing["models"] if item["slug"] == slug)["dispatch_supported"])
+            self.assertFalse(next(item for item in listing["models"] if item["slug"] == "sol")["dispatch_supported"])
+            self.assertEqual(set(listing["first_use_check"]["selectable_models"]), dispatch_slugs)
+            notice = listing["catalog_notice"]
+            self.assertEqual(notice["status"], "pending_change")
+            self.assertEqual([item["slug"] for item in notice["pending"][0]["changes"]["added_models"]], [slug])
+            self.assertEqual(notice["current_roles"], profile["roles"])
+
+            code, ack = self.run_cli("catalog-ack", "--fingerprint", notice["fingerprint"], "--decision", "defer")
+            self.assertEqual(code, 0, ack)
+            code, repeated = self.run_cli("models", "--dispatch-models", dispatch)
+            self.assertEqual(code, 0, repeated)
+            self.assertEqual(repeated["catalog_notice"]["status"], "unchanged")
+            self.assertEqual((self.host / "models_cache.json").read_bytes(), cache_bytes)
+            for path, original in preserved.items():
+                self.assertEqual(path.read_bytes(), original)
+
     def test_reset_last_override_does_not_require_a_model_cache(self) -> None:
         self.legacy_catalog()
         (self.host / "models_cache.json").unlink()
