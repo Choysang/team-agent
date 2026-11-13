@@ -34,7 +34,7 @@
 
 | 宿主 | 主方案 | 降级方案 | 升级阶梯 | 运行证据 | 验证程度 |
 |---|---|---|---|---|---|
-| Claude Code | 技能自带mod `team-agent-router` 按角色类型补全model/effort，配合生成的team-*角色文件 | 插件被禁用时：角色文件frontmatter + CLAUDE.md路由块 | 完整：单次调用传model与effort | 子代理meta与transcript、mod派发日志 | 已实测 |
+| Claude Code | 技能自带mod `team-agent-router` 按角色类型补全model/effort，配合生成的team-*角色文件 | 插件被禁用时：角色文件frontmatter + CLAUDE.md路由块 | 完整：单次调用传model与effort | 子代理meta与transcript、mod派发日志 | 历史主方案已实测；当前版本规则按文档核对 |
 | Codex | 角色TOML的 `model`/`model_reasoning_effort`（含原生角色的受管绑定），派发时显式传入；固定通用入口冲突按 Codex 卡使用已批准职能后备 | 无Python时手工写TOML | 派发参数含模型与档位；角色固定值仍优先 | state_5.sqlite与会话JSONL | 已实测 |
 | Antigravity | `profile.json` + `config/AGENTS.md` 路由块，派发调用传 `Model`（inherit/flash/pro） | 无 | 单次调用可换档位（flash_lite→flash→pro，或inherit用主会话模型）；无独立强度 | 本地 conversations/<id>.db 与 transcript | 已实测 |
 | Gemini CLI | settings.json `agents.overrides.<内置>.modelConfig.model` + `~/.gemini/agents/team-*.md` | 无 | 只能换代理 | 无本地记录（/stats） | 仅文档 |

@@ -1,8 +1,8 @@
 # Claude Code 适配
-<!-- adapter: host=claude-code; verified=2026-10-27; host_version=2.1.308; evidence=tested -->
+<!-- adapter: host=claude-code; verified=2026-11-13; host_version=2.1.321; evidence=docs -->
 [返回能力与宿主分流](../harness-matrix.md) · [返回主流程](../../SKILL.md)
 
-适用于Claude Code CLI、IDE扩展、桌面应用，以及Claude应用中的Claude Code会话。识别依据：派发工具 `Agent`（旧名 `Task`）的参数含 `subagent_type`、`model`、`effort`。核对日期：2026-10-27（官方文档 + 本机实测）。
+适用于Claude Code CLI、IDE扩展、桌面应用，以及Claude应用中的Claude Code会话。识别依据：派发工具 `Agent`（旧名 `Task`）的参数含 `subagent_type`、`model`、`effort`。当前规则于2026-11-13核对官方文档；历史实测范围见文末，新能力尚未取得本次子代理调用证据。
 
 宿主版本以实际执行本会话的进程为准：桌面应用内嵌自己的Claude Code（Windows上在 `%LOCALAPPDATA%\Claude-Data\...\claude-code\<版本>\claude.exe`，会话内 `/status` 的Claude Code行），可能与终端 `claude --version` 不同；mod门槛按前者判断。
 
@@ -11,13 +11,16 @@
 | 项目 | 行为 |
 |---|---|
 | 模型优先级 | 本次调用 `model` > 代理文件 `model` > `CLAUDE_CODE_SUBAGENT_MODEL` > 主会话模型。`CLAUDE_CODE_SUBAGENT_MODEL_FORCE=1` 时环境变量压过一切 |
-| 强度优先级 | `CLAUDE_CODE_EFFORT_LEVEL` > 本次调用 `effort` > 代理文件 `effort` > 会话档位 |
+| 强度优先级 | `CLAUDE_CODE_EFFORT_LEVEL` > 本次调用 `effort` > 代理文件 `effort`；都未设置时，同模型继承会话档位，跨模型按目标模型默认与宿主设置解析 |
 | 可派发值 | 调用参数 `model` 只接受别名（以本次工具枚举为准，常见 sonnet/opus/haiku/fable）；代理文件还接受完整ID与inherit。`effort`：low/medium/high/xhigh/max，不支持时降到不高于它的最高档 |
-| 档位表 | Anthropic API上 Opus 5.5、Sonnet 5.5、Haiku 5.5、Fable 5.1 均支持五档；5.5系列默认medium，Fable默认high。其他服务商（Bedrock、Vertex、Foundry）别名解析不同，档位以现场为准 |
+| 档位表 | 当前 Opus 5.5、Sonnet 5.5、Haiku 5.5、Fable 5.2 在Claude Code均默认medium，支持五档；Fable 5.1默认high。API默认值单列，不套用于Claude Code。别名、版本、服务商或账号限制不同，档位以现场为准 |
+| Explore默认 | 随主会话模型，Fable下按连接方式可能用opus；不要假设默认haiku。显式路由保留内置提示词 |
 | 内置角色 | Explore、Plan、general-purpose、claude等带系统提示词；同名用户文件会整体替换它们 |
 | 扩展思考 / Fast | 跟随主会话，无按子代理设置 |
 | fork | 继承主模型且不接受effort |
 | Mod | 插件中的 `tool.call`、`agent.spawn` 钩子在进程内改写派发；2.1.287+（桌面2.1.286+）可用，组织策略可禁止 |
+
+初次建议或重新选型时再读 [Claude模型选择](../claude-model-selection.md)：按任务可验证性和完成任务的总成本给候选，不用最新型号或最高档位重置已有选择。Fable 5.2要求2.1.321+；未知新模型不会从旧别名借用上下文或档位。版本表只给参考解析，实际值仍需新调用验证。
 
 ## 职能到角色类型
 
@@ -60,15 +63,17 @@ mod是以用户权限运行的代码，先告诉用户它做什么（只改子�
 
 ### 2. 写入配置（有Python 3.11+时）
 
-在技能目录用你的Shell执行。`--dispatch-models` 与 `--dispatch-efforts` 填你自己Agent工具参数里的枚举，即当前真正可派发的值：
+在技能目录用你的Shell执行。每次使用先读取当前Agent工具定义，`--dispatch-models` 与 `--dispatch-efforts` 填本次枚举；`--host-version` 填当前会话实际内嵌宿主版本，不能拿另一个PATH版本代替。没有独立effort参数时传空字符串，不补造五档：
 
 ```text
-python scripts/claude_code_adapter.py onboarding --dispatch-models <model枚举> --dispatch-efforts <effort枚举>
-python scripts/claude_code_adapter.py sync --profile <profile.json>
+python scripts/claude_code_adapter.py onboarding --host-version <当前宿主版本> --dispatch-models <model枚举> --dispatch-efforts <effort枚举>
+python scripts/claude_code_adapter.py sync --profile <profile.json> --host-version <当前宿主版本> --dispatch-models <model枚举> --dispatch-efforts <effort枚举>
 python scripts/claude_code_adapter.py verify
 ```
 
-`sync` 写入CLAUDE.md受管块、四个team-*文件和mod读取的 `routing.json`。`verify` 核对文件，并报告mod会不会被加载（`mod.will_load` 与加载方式）。
+`sync` 写入CLAUDE.md受管块、四个team-*文件和mod读取的 `routing.json`；缺少本次三项信息时拒绝新配置写入。`verify` 核对文件，并报告mod会不会被加载（`mod.will_load` 与加载方式）。所有子命令都接受这三个现场参数，`resolve`亦可携带当前枚举检测新模型；未刷新时读取或派发已存选择仍可继续，但不是新的可用性证明。
+
+默认自动识别用户设置和进程中的网关/第三方提供商开关，其档位未知时只提供inherit。`--provider anthropic`仅在已确认提供商时显式使用；适配器不切服务商、不写环境变量，不改模型白名单。
 
 其他命令：`ladder --role <职能> [--from <模型>/<强度>]`（升级阶梯：同模型medium→max，再换更强模型从medium起）、`resolve`（含首选模型的冷却与恢复状态）、`classify --text`（把错误原文分成额度/限流/过载/网络等）、`failover`（切备选并记录冷却）、`recover --role <职能|all>`（冷却结束后回到首选）、`stats --days 7`（按角色类型统计实际派发的模型与强度，并标出与路由表不符的派发）、`preference`、`catalog-ack`、`bind`、`probe`。
 
@@ -108,7 +113,9 @@ Cursor与VS Code也会读取 `~/.claude/agents/`。存在 `~/.cursor` 时，按 
 
 ## 新模型检测
 
-onboarding记录当前Agent工具的model/effort枚举，并从最近的子代理元数据读取别名的实际解析（例如haiku→claude-haiku-5-5）。别名解析到新ID、枚举增减都会生成待处理指纹；新模型档位未知时不补造。期间resolve仍按用户原选择派发并警告，等用户在更新卡中处理后再 `catalog-ack`。
+每次使用先传入当前工具枚举，不能只依赖onboarding保存的 `dispatch.json`。缓存标为 `cached_dispatch_tool`、`refresh_required=true`，未刷新时选择卡不提供缓存模型；空effort枚举也约束model=inherit的选择。宿主没有暴露当前枚举时保持已有配置并说明限制。
+
+别名pin、宿主版本参考和历史观测分别报告。`ANTHROPIC_DEFAULT_*_MODEL`优先作为固定配置；版本参考不被旧日志覆盖。`last_observed_model`单列历史实际ID，其变化也触发通知，但不冒充本次结果。缺版本时使用明确标注的缓存版本或保持未知，不假定最新版本。新别名、新工具档位、参考解析与历史观测的变化都会生成待处理指纹；未知能力不补造。期间resolve仍按用户原选择派发，等用户在更新卡中处理后再 `catalog-ack`，保持配置只确认该次指纹。
 
 ## 运行验证
 
@@ -129,4 +136,4 @@ onboarding记录当前Agent工具的model/effort枚举，并从最近的子代�
 - 五个职能各派一次且均不传model/effort，mod全部补参：Explore→claude-haiku-5-5/max、general-purpose→claude-sonnet-5-5/high、Plan→claude-opus-5-5/max、team-reviewer→claude-opus-5-5/medium、team-researcher→claude-sonnet-5-5/medium；meta请求值、每轮transcript实际值与dispatch-log一致，均有pong输出。
 - 子代理历史里若有经第三方服务商的旧记录（如sonnet→mimo-v2.6-flash），`observed_resolutions` 会取到它并把该别名的档位判为未知、sync拒绝；先显式派一次该别名的最小调用刷新解析，再 `catalog-ack`。
 
-来源：[插件加载](https://code.claude.com/docs/en/plugins/loading.md)、[子代理](https://code.claude.com/docs/en/sub-agents)、[模型配置](https://code.claude.com/docs/en/model-config)、[Mods](https://code.claude.com/docs/en/plugins/mods/overview.md)、[issue #69545讨论](https://claudeissues.com/issue/69545-feature-request-subagentstart-hook-should-support-updatedinput-to-enable-determi)。
+来源：[模型选择指南](https://claude.dev/blog/which-claude-model-should-you-build-with/)、[插件加载](https://code.claude.com/docs/en/plugins/loading.md)、[子代理](https://code.claude.com/docs/en/sub-agents)、[模型配置](https://code.claude.com/docs/en/model-config)、[Mods](https://code.claude.com/docs/en/plugins/mods/overview.md)、[Fast](https://code.claude.com/docs/en/fast-mode)、[issue #69545讨论](https://claudeissues.com/issue/69545-feature-request-subagentstart-hook-should-support-updatedinput-to-enable-determi)。

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 import sys
@@ -21,6 +22,9 @@ class Fixture(unittest.TestCase):
         self.home = root / "测试用户" / ".claude"
         (self.home / "agents").mkdir(parents=True)
         self.profile = root / "profile.json"
+        # The fixture emulates a host exposing these current tool definitions.
+        self.tool_models = "sonnet,opus,haiku,fable"
+        self.tool_efforts = "low,medium,high,xhigh,max"
         self.write_profile({
             "Explorer": self.role("haiku", "max"),
             "Executor": self.role("sonnet", "high", [("opus", "medium"), ("fable", "high")]),
@@ -37,7 +41,15 @@ class Fixture(unittest.TestCase):
     def write_profile(self, roles, **extra):
         self.profile.write_text(json.dumps({"schema_version": 2, "roles": roles, **extra}), encoding="utf-8")
 
-    def run_cli(self, *args, env=None):
+    def run_cli(self, *args, env=None, host_version="2.1.321", supply_dispatch=True):
+        args = list(args)
+        for flag, attr in (("--dispatch-models", "tool_models"), ("--dispatch-efforts", "tool_efforts")):
+            if flag in args:
+                setattr(self, attr, args[args.index(flag) + 1])
+            elif "sync" in args and supply_dispatch:
+                args.extend((flag, getattr(self, attr)))
+        if "--host-version" not in args and host_version is not None:
+            args.extend(("--host-version", host_version))
         command = [sys.executable, str(SCRIPT), "--state-dir", str(self.state),
                    "--claude-home", str(self.home), *args]
         completed = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", env=env)
@@ -88,6 +100,179 @@ class ClaudeCodeAdapterTests(Fixture):
         code, out = self.run_cli("sync", "--profile", str(self.profile))
         self.assertEqual(code, 1)  # Executor fallback uses opus/fable, not in enum
         self.assertIn("opus", out["error"])
+
+    def test_cached_enum_is_not_presented_as_current_selection(self):
+        _, current = self.run_cli("models", "--dispatch-models", "sonnet,haiku",
+                                  "--dispatch-efforts", "low,medium,high")
+        self.assertEqual(current["first_use_check"]["selectable_models"], ["sonnet", "haiku", "inherit"])
+        _, cached = self.run_cli("models")
+        self.assertTrue(cached["dispatch_enum"]["refresh_required"])
+        self.assertEqual(cached["dispatch_enum"]["source"], "cached_dispatch_tool")
+        self.assertEqual(cached["first_use_check"]["selectable_models"], ["inherit"])
+        self.assertEqual(cached["first_use_check"]["current_roles"], None)
+
+    def test_unverified_defaults_are_not_callable_candidates(self):
+        _, out = self.run_cli("onboarding")
+        self.assertEqual(out["first_use_check"]["selectable_models"], ["inherit"])
+        self.assertFalse(out["first_use_check"]["selection_ready"])
+
+    def test_sync_cannot_create_choices_from_unverified_defaults_or_cache(self):
+        code, out = self.run_cli("sync", "--profile", str(self.profile),
+                                 host_version=None, supply_dispatch=False)
+        self.assertEqual(code, 1, out)
+        self.assertIn("requires CURRENT", out["error"])
+        self.assertFalse((self.home / "CLAUDE.md").exists())
+        self.run_cli("models", "--dispatch-models", self.tool_models, "--dispatch-efforts", self.tool_efforts)
+        code, out = self.run_cli("sync", "--profile", str(self.profile), supply_dispatch=False)
+        self.assertEqual(code, 1, out)
+        self.assertFalse((self.state / "profile.json").exists())
+
+    def test_omitting_version_does_not_promote_cached_host_to_latest(self):
+        self.run_cli("models", "--host-version", "2.1.292", "--dispatch-models", "haiku",
+                     "--dispatch-efforts", "low,medium,high,xhigh,max")
+        _, out = self.run_cli("models", host_version=None)
+        self.assertEqual(out["models"][0]["resolves_to"], "claude-haiku-4-5")
+        self.assertEqual(out["models"][0]["resolution_source"], "cached_host_version")
+        self.assertEqual(out["catalog_notice"]["status"], "unchanged")
+        self.assertFalse(out["first_use_check"]["selection_ready"])
+
+    def test_unknown_version_does_not_invent_latest_capabilities(self):
+        _, out = self.run_cli("models", "--dispatch-models", "fable", "--dispatch-efforts", "medium,high",
+                              host_version=None)
+        self.assertIsNone(out["models"][0]["resolves_to"])
+        self.assertIsNone(out["models"][0]["supported_reasoning_levels"])
+        self.assertFalse(out["first_use_check"]["selection_ready"])
+
+    def test_inherit_cannot_bypass_empty_effort_enum(self):
+        self.write_profile({"Explorer": self.role("inherit", "max")})
+        code, out = self.run_cli("sync", "--profile", str(self.profile),
+                                 "--dispatch-models", "haiku", "--dispatch-efforts", "")
+        self.assertEqual(code, 1, out)
+        self.assertFalse((self.state / "profile.json").exists())
+
+    def test_current_enum_on_resolve_detects_successive_unknown_models(self):
+        self.run_cli("sync", "--profile", str(self.profile))
+        original = {p: p.read_bytes() for p in [self.state / "profile.json", self.home / "CLAUDE.md"]}
+        for alias in ("future-model-a", "future-model-b"):
+            code, out = self.run_cli("resolve", "--role", "Explorer", "--dispatch-models",
+                                     f"sonnet,opus,haiku,fable,{alias}", "--dispatch-efforts", "medium,high")
+            self.assertEqual(code, 0, out)
+            notice = out["catalog_notice"]
+            self.assertEqual(notice["status"], "pending_change")
+            added = [m["slug"] for change in notice["pending"] for m in change["changes"]["added_models"]]
+            self.assertIn(alias, added)
+            self.run_cli("catalog-ack", "--fingerprint", notice["fingerprint"], "--decision", "defer")
+        self.assertEqual({p: p.read_bytes() for p in original}, original)
+
+    def test_explicit_empty_effort_enum_does_not_restore_default_tiers(self):
+        code, out = self.run_cli("models", "--dispatch-models", "haiku", "--dispatch-efforts", "")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(out["models"][0]["supported_reasoning_levels"], [])
+        self.assertEqual(out["dispatch_enum"]["efforts"], [])
+
+    def test_alias_resolution_respects_actual_host_version(self):
+        for version, expected, default in (("2.1.308", "claude-fable-5-1", "high"),
+                                           ("2.1.321", "claude-fable-5-2", "medium")):
+            code, out = self.run_cli("models", "--host-version", version, "--dispatch-models", "fable",
+                                     "--dispatch-efforts", "low,medium,high,xhigh,max")
+            self.assertEqual(code, 0, out)
+            model = out["models"][0]
+            self.assertEqual((model["resolves_to"], model["default_effort"]), (expected, default))
+        _, out = self.run_cli("models", "--host-version", "2.1.292", "--dispatch-models", "haiku",
+                              "--dispatch-efforts", "low,medium,high,xhigh,max")
+        self.assertEqual(out["models"][0]["resolves_to"], "claude-haiku-4-5")
+        self.assertEqual(out["models"][0]["supported_reasoning_levels"], [])
+
+    def test_alias_pin_precedes_old_telemetry_and_keeps_model_capabilities(self):
+        self.write_agent("old-fable", "fable", "max", "claude-fable-5-2", time.time())
+        settings = self.home / "settings.json"
+        settings.write_text(json.dumps({"env": {"ANTHROPIC_DEFAULT_FABLE_MODEL": "claude-fable-5-1"}}),
+                            encoding="utf-8")
+        before = settings.read_bytes()
+        _, out = self.run_cli("models", "--dispatch-models", "fable", "--dispatch-efforts", "medium,high,max")
+        model = out["models"][0]
+        self.assertEqual((model["resolves_to"], model["resolution_source"]),
+                         ("claude-fable-5-1", "host_alias_pin"))
+        self.assertEqual(model["supported_reasoning_levels"], ["medium", "high", "max"])
+        self.assertEqual(settings.read_bytes(), before)
+
+    def test_unknown_resolved_model_does_not_borrow_alias_context(self):
+        self.write_agent("custom", "haiku", "medium", "provider-custom-model", time.time())
+        _, out = self.run_cli("models", host_version=None)
+        model = next(m for m in out["models"] if m["slug"] == "haiku")
+        self.assertIsNone(model["supported_reasoning_levels"])
+        self.assertIsNone(model["context"])
+        self.assertIsNone(model["fast_supported"])
+
+    def test_current_version_and_historical_observations_are_separate(self):
+        self.write_agent("old-fable", "fable", "high", "claude-fable-5-1", time.time())
+        _, out = self.run_cli("models", "--dispatch-models", "fable", "--dispatch-efforts", "medium,high")
+        self.assertEqual(out["models"][0]["resolves_to"], "claude-fable-5-2")
+        self.assertEqual(out["models"][0]["last_observed_model"], "claude-fable-5-1")
+        self.write_agent("future-fable", "fable", "high", "claude-fable-future", time.time() + 2)
+        _, out = self.run_cli("models", "--dispatch-models", "fable", "--dispatch-efforts", "medium,high")
+        self.assertEqual(out["catalog_notice"]["status"], "pending_change")
+        self.assertEqual(out["models"][0]["last_observed_model"], "claude-fable-future")
+
+    def test_pinned_new_model_is_not_selectable_on_old_host(self):
+        (self.home / "settings.json").write_text(json.dumps({
+            "env": {"ANTHROPIC_DEFAULT_FABLE_MODEL": "claude-fable-5-2"}}), encoding="utf-8")
+        _, out = self.run_cli("models", "--host-version", "2.1.308", "--dispatch-models", "fable",
+                              "--dispatch-efforts", "medium,high")
+        self.assertFalse(out["models"][0]["host_version_supported"])
+        self.assertEqual(out["first_use_check"]["selectable_models"], ["inherit"])
+        self.write_profile({"Explorer": self.role("fable", "high")})
+        code, out = self.run_cli("sync", "--profile", str(self.profile), "--host-version", "2.1.308")
+        self.assertEqual(code, 1, out)
+
+    def test_unknown_provider_effort_changes_are_not_suppressed(self):
+        self.run_cli("--provider", "other", "models", "--dispatch-models", "haiku", "--dispatch-efforts", "medium")
+        _, out = self.run_cli("--provider", "other", "models", "--dispatch-models", "haiku",
+                              "--dispatch-efforts", "medium,high,future-tier")
+        self.assertEqual(out["catalog_notice"]["status"], "pending_change")
+        self.assertIsNone(out["models"][0]["supported_reasoning_levels"])
+        self.assertIn("future-tier", out["models"][0]["tool_effort_levels"])
+
+    def test_effort_changes_are_detected_even_without_model_aliases(self):
+        self.run_cli("models", "--dispatch-models", "", "--dispatch-efforts", "medium")
+        _, out = self.run_cli("models", "--dispatch-models", "", "--dispatch-efforts", "medium,high")
+        self.assertEqual(out["catalog_notice"]["status"], "pending_change")
+        self.assertEqual(out["catalog_notice"]["pending"][0]["changes"]["dispatch_efforts"],
+                         {"previous": ["medium"], "current": ["high", "medium"]})
+
+    def test_provider_boolean_flag_keeps_json_response(self):
+        (self.home / "settings.json").write_text(json.dumps({
+            "env": {"CLAUDE_CODE_USE_BEDROCK": True}}), encoding="utf-8")
+        code, out = self.run_cli("models")
+        self.assertEqual(code, 0, out)
+        self.assertIsNone(out["models"][0]["supported_reasoning_levels"])
+
+    def test_old_fingerprint_order_is_migrated_without_empty_notice(self):
+        _, out = self.run_cli("models", "--dispatch-models", self.tool_models, "--dispatch-efforts", self.tool_efforts)
+        path = self.state / "catalog_state.json"
+        state = json.loads(path.read_text(encoding="utf-8"))
+        for model in state["last_seen_models"]:
+            for key in ("tool_effort_levels", "last_observed_model", "observed_at", "observed_differs_from_reference"):
+                model.pop(key, None)
+        old_core = [{"slug": m["slug"], "resolves_to": m["resolves_to"],
+                     "levels": m["supported_reasoning_levels"]} for m in state["last_seen_models"]]
+        state["last_seen_fingerprint"] = hashlib.sha256(json.dumps(old_core, sort_keys=True).encode()).hexdigest()
+        path.write_text(json.dumps(state), encoding="utf-8")
+        _, out = self.run_cli("models", "--dispatch-models", self.tool_models, "--dispatch-efforts", self.tool_efforts)
+        self.assertEqual(out["catalog_notice"]["pending"], [])
+
+    def test_gateway_is_not_treated_as_direct_anthropic(self):
+        (self.home / "settings.json").write_text(json.dumps({
+            "env": {"ANTHROPIC_BASE_URL": "https://gateway.example/v1"}}), encoding="utf-8")
+        _, out = self.run_cli("models", "--dispatch-models", "sonnet", "--dispatch-efforts", "medium,high")
+        self.assertIsNone(out["models"][0]["supported_reasoning_levels"])
+        self.assertIsNone(out["models"][0]["context"])
+
+    def test_enum_reordering_does_not_prompt_and_cross_model_effort_is_explicit(self):
+        self.run_cli("models", "--dispatch-models", "haiku,sonnet", "--dispatch-efforts", "low,medium,high")
+        _, out = self.run_cli("models", "--dispatch-models", "sonnet,haiku", "--dispatch-efforts", "high,low,medium")
+        self.assertEqual(out["catalog_notice"]["status"], "unchanged")
+        self.assertEqual(out["first_use_check"]["effort_when_model_changes"], "host_model_default_unless_explicit")
 
     def test_other_provider_has_unknown_efforts_but_inherit_still_allowed(self):
         code, out = self.run_cli("--provider", "other", "models")
@@ -185,12 +370,12 @@ class ClaudeCodeAdapterTests(Fixture):
     def test_catalog_change_detected_once_from_observed_resolution(self):
         self.run_cli("models")
         self.write_agent("old1", "haiku", "low", "claude-haiku-6-0", time.time())
-        _, out = self.run_cli("models")
+        _, out = self.run_cli("models", host_version=None)
         notice = out["catalog_notice"]
         self.assertEqual(notice["status"], "pending_change")
         changed = notice["pending"][0]["changes"]["changed_models"][0]
-        self.assertEqual((changed["slug"], changed["resolves_to"]), ("haiku", "claude-haiku-6-0"))
-        self.assertIsNone(changed["supported_reasoning_levels"])  # unknown, never guessed
+        self.assertEqual((changed["slug"], changed["last_observed_model"]), ("haiku", "claude-haiku-6-0"))
+        self.assertEqual(changed["resolves_to"], "claude-haiku-5-5")  # reference is not historical telemetry
         _, out = self.run_cli("catalog-ack", "--fingerprint", notice["fingerprint"], "--decision", "defer")
         self.assertEqual(out["status"], "acknowledged")
         _, out = self.run_cli("models")
@@ -201,13 +386,13 @@ class ClaudeCodeAdapterTests(Fixture):
     def test_resolve_keeps_dispatching_when_alias_moves_to_unknown_model(self):
         self.run_cli("sync", "--profile", str(self.profile))
         self.write_agent("n1", "haiku", "max", "claude-haiku-6-0", time.time())
-        code, out = self.run_cli("resolve", "--role", "Explorer")
+        code, out = self.run_cli("resolve", "--role", "Explorer", host_version=None)
         self.assertEqual(code, 0, out)
         self.assertEqual(out["dispatch_parameters"], {"model": "haiku", "effort": "max"})
-        self.assertIn("choice_not_confirmed_by_current_catalog", {w["code"] for w in out["warnings"]})
+        self.assertIn("historical_model_differs_from_reference", {w["code"] for w in out["warnings"]})
         code, out = self.run_cli("verify")
-        self.assertEqual(code, 1)
-        self.assertTrue(out["problems"][0].startswith("profile_not_valid_for_current_catalog"))
+        self.assertEqual(code, 0, out)  # static reference matches; actual dispatch still needs a fresh probe
+        self.assertEqual(out["runtime_status"], "runtime_unverified")
 
     def test_probe_requires_fresh_distinct_matching_agents(self):
         self.run_cli("sync", "--profile", str(self.profile))
@@ -288,6 +473,32 @@ class ClaudeCodeTeamFilesAndHookTests(Fixture):
 
 
 class RecoveryAndStatsTests(Fixture):
+    def test_unavailable_unrelated_fallback_does_not_block_switch_or_recovery(self):
+        self.write_profile({"Explorer": self.role("haiku", "medium", [("sonnet", "high")]),
+                            "Executor": self.role("opus", "medium", [("fable", "high")])})
+        self.run_cli("sync", "--profile", str(self.profile))
+        _, before = self.run_cli("models")
+        executor = before["first_use_check"]["current_roles"]["Executor"]
+        code, out = self.run_cli("failover", "--role", "Explorer", "--reason", "overloaded", "--event-id", "switch",
+                                 "--dispatch-models", "haiku,sonnet,opus", "--dispatch-efforts", self.tool_efforts)
+        self.assertEqual((code, out["status"], out["active_model"]), (0, "failed_over", "sonnet"), out)
+        self.assertIn({"role": "Executor", "model": "fable", "effort": "high"}, out["unavailable_saved_choices"])
+        code, out = self.run_cli("recover", "--role", "Explorer", "--force")
+        self.assertEqual((code, out["restored_to_primary"]), (0, ["Explorer"]), out)
+        _, after = self.run_cli("models")
+        self.assertEqual(after["first_use_check"]["current_roles"]["Executor"], executor)
+
+    def test_unavailable_activation_target_does_not_modify_profile(self):
+        self.write_profile({"Explorer": self.role("haiku", "medium", [("sonnet", "high")])})
+        self.run_cli("sync", "--profile", str(self.profile))
+        path = self.state / "profile.json"
+        before = path.read_bytes()
+        code, out = self.run_cli("failover", "--role", "Explorer", "--reason", "overloaded", "--event-id", "switch",
+                                 "--dispatch-models", "haiku", "--dispatch-efforts", self.tool_efforts)
+        self.assertEqual(code, 1, out)
+        self.assertIn("activation sonnet/high", out["error"])
+        self.assertEqual(path.read_bytes(), before)
+
     def test_classify_messages(self):
         cases = {"429 Too Many Requests": ("rate_limit", True), "API Error: 529 Overloaded": ("overloaded", True),
                  "Your organization's usage limit has been reached": ("workspace_quota_exceeded", False),

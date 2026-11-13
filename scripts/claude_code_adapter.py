@@ -4,7 +4,8 @@
 Claude Code resolves a subagent's model as: per-invocation ``model`` > agent
 frontmatter ``model`` > CLAUDE_CODE_SUBAGENT_MODEL > main session model, and
 effort as: CLAUDE_CODE_EFFORT_LEVEL > per-invocation ``effort`` > frontmatter
-``effort`` > session level. Built-in agents (Explore, Plan, general-purpose)
+``effort`` > same-model session level; cross-model defaults can differ.
+Built-in agents (Explore, Plan, general-purpose)
 keep their own instructions, so this adapter does not overwrite them; it writes
 a managed routing block into the user CLAUDE.md telling the main agent which
 agent type, model and effort to pass for each function. Specialist agent files
@@ -21,10 +22,12 @@ import datetime as dt
 import hashlib
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
 from typing import Any, Mapping
+from urllib.parse import urlsplit
 
 _SCRIPT_DIR = str(Path(__file__).resolve().parent)
 if _SCRIPT_DIR not in sys.path:
@@ -43,20 +46,33 @@ EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
 DEFAULT_DISPATCH_MODELS = ("sonnet", "opus", "haiku", "fable")
 CATALOG_STATE_VERSION = 1
 
-# Verified against https://code.claude.com/docs/en/model-config on 2026-10-27
-# for the Anthropic API provider. Other providers resolve aliases differently
-# (e.g. Foundry haiku -> Haiku 4.5 without effort), so they stay unknown.
-ANTHROPIC_ALIASES: dict[str, dict[str, Any]] = {
-    "opus": {"resolves_to": "claude-opus-5-5", "efforts": EFFORT_LEVELS,
-             "default_effort": "medium", "context": "1M native"},
-    "sonnet": {"resolves_to": "claude-sonnet-5-5", "efforts": EFFORT_LEVELS,
-               "default_effort": "medium", "context": "1M native"},
-    "haiku": {"resolves_to": "claude-haiku-5-5", "efforts": EFFORT_LEVELS,
-              "default_effort": "medium", "context": "1M native"},
-    "fable": {"resolves_to": "claude-fable-5-1", "efforts": EFFORT_LEVELS,
-              "default_effort": "high", "context": "1M native"},
+# Documented capabilities are keyed by resolved ID, never borrowed from an alias.
+# These references do not enumerate what an account or running tool can dispatch.
+MODEL_CAPABILITIES: dict[str, dict[str, Any]] = {
+    **{model: {"efforts": EFFORT_LEVELS, "default_effort": "medium", "context": "1M native",
+               "api_default_effort": "high" if model in ("claude-sonnet-5-5", "claude-fable-5-2") else "medium",
+               "fast_supported": model in ("claude-opus-5-5", "claude-fable-5-2")}
+       for model in ("claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5", "claude-fable-5-2")},
+    **{model: {"efforts": EFFORT_LEVELS, "default_effort": "high", "api_default_effort": "high",
+               "context": "1M native", "fast_supported": model in ("claude-opus-5", "claude-opus-4-8")}
+       for model in ("claude-fable-5-1", "claude-fable-5", "claude-opus-5", "claude-opus-4-8", "claude-sonnet-5")},
+    "claude-haiku-4-5": {"efforts": (), "default_effort": None, "api_default_effort": None,
+                         "context": "200k native", "fast_supported": False},
 }
-TABLE_SOURCE = "code.claude.com/docs/en/model-config (verified 2026-10-27, Anthropic API)"
+ALIAS_HISTORY = {
+    "fable": (((2, 1, 321), "claude-fable-5-2"), ((2, 1, 257), "claude-fable-5-1"),
+              ((0, 0, 0), "claude-fable-5")),
+    "opus": (((2, 1, 280), "claude-opus-5-5"), ((2, 1, 219), "claude-opus-5"),
+             ((2, 1, 154), "claude-opus-4-8")),
+    "sonnet": (((2, 1, 284), "claude-sonnet-5-5"), ((2, 1, 197), "claude-sonnet-5")),
+    "haiku": (((2, 1, 293), "claude-haiku-5-5"), ((0, 0, 0), "claude-haiku-4-5")),
+}
+MINIMUM_HOST_VERSION = {
+    "claude-fable-5-2": (2, 1, 321), "claude-fable-5-1": (2, 1, 257),
+    "claude-opus-5-5": (2, 1, 280), "claude-sonnet-5-5": (2, 1, 284),
+    "claude-haiku-5-5": (2, 1, 293),
+}
+TABLE_SOURCE = "code.claude.com/docs/en/model-config (checked 2026-11-13; Anthropic API reference, not account availability)"
 
 # Built-in agent types keep their own system prompt; a same-named file would
 # replace it, so built-ins get parameters (mod/routing) instead of files.
@@ -118,6 +134,7 @@ BLOCK_END = "<!-- team-agent:claude-code routing:end -->"
 MANAGED_TAG = "# team-agent managed"
 
 CATALOG_NOTICE: dict[str, Any] | None = None
+DISPATCH_NOTICE: dict[str, Any] | None = None
 
 
 class JsonArgumentParser(argparse.ArgumentParser):
@@ -130,6 +147,8 @@ def emit(value: Mapping[str, Any]) -> None:
     payload = {"host": HOST, **value}
     if CATALOG_NOTICE is not None:
         payload.setdefault("catalog_notice", CATALOG_NOTICE)
+    if DISPATCH_NOTICE is not None:
+        payload.setdefault("dispatch_freshness", DISPATCH_NOTICE)
     data = (json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
     out = getattr(sys.stdout, "buffer", None)
     if out is not None:
@@ -170,9 +189,34 @@ def dispatch_enum(state_dir: Path) -> dict[str, Any]:
     if path.exists():
         data = _read_json(path, "dispatch enum")
         if isinstance(data, dict) and isinstance(data.get("models"), list):
-            return {**data, "source": "caller_supplied_dispatch_tool"}
+            return {**data, "source": "cached_dispatch_tool", "models_current": False,
+                    "efforts_current": False, "refresh_required": True}
     return {"models": list(DEFAULT_DISPATCH_MODELS), "efforts": list(EFFORT_LEVELS),
-            "source": "documented_default_unverified"}
+            "source": "documented_default_unverified", "models_current": False,
+            "efforts_current": False, "refresh_required": True}
+
+
+def _host_environment(claude_home: Path) -> dict[str, str]:
+    return {**(_settings(claude_home).get("env") or {}), **os.environ}
+
+
+def _provider_kind(requested: str, env: Mapping[str, str]) -> str:
+    if requested != "auto":
+        return requested
+    if any(str(env.get(key, "")).lower() in ("1", "true") for key in (
+            "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY")):
+        return "other"
+    base_url = env.get("ANTHROPIC_BASE_URL", "")
+    return "other" if base_url and urlsplit(base_url).hostname != "api.anthropic.com" else "anthropic"
+
+
+def _version_tuple(value: str | None) -> tuple[int, int, int] | None:
+    if value is None:
+        return None
+    match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)(?:[-+].*)?", value)
+    if not match:
+        raise AdapterError("--host-version must name the running host's version, such as 2.1.321")
+    return tuple(int(part) for part in match.groups())
 
 
 def observed_resolutions(claude_home: Path, limit: int = 200) -> dict[str, dict[str, Any]]:
@@ -212,43 +256,82 @@ def _iter_lines(path: Path):
         return
 
 
-def build_catalog(state_dir: Path, claude_home: Path, provider: str) -> list[dict[str, Any]]:
-    enum = dispatch_enum(state_dir)
+def build_catalog(state_dir: Path, claude_home: Path, provider: str,
+                  enum: Mapping[str, Any] | None = None, host_version: str | None = None) -> list[dict[str, Any]]:
+    enum = enum if enum is not None else dispatch_enum(state_dir)
+    env = _host_environment(claude_home)
+    provider = _provider_kind(provider, env)
+    version = _version_tuple(host_version or enum.get("host_version"))
     observed = observed_resolutions(claude_home)
-    allowed_efforts = [e for e in enum.get("efforts") or EFFORT_LEVELS if e in EFFORT_LEVELS]
+    allowed_efforts = [e for e in enum.get("efforts", EFFORT_LEVELS) if e in EFFORT_LEVELS]
     models = []
     for alias in enum["models"]:
-        documented = ANTHROPIC_ALIASES.get(alias) if provider == "anthropic" else None
+        history = ALIAS_HISTORY.get(alias, ()) if provider == "anthropic" else ()
+        documented_id = next((model for since, model in history if version is not None and version >= since), None)
+        pinned = env.get(f"ANTHROPIC_DEFAULT_{alias.upper()}_MODEL")
         seen = observed.get(alias)
-        resolves_to = (seen or {}).get("resolves_to") or (documented or {}).get("resolves_to")
+        resolves_to = pinned or documented_id or (seen or {}).get("resolves_to")
+        capabilities = MODEL_CAPABILITIES.get(resolves_to) if provider == "anthropic" else None
+        minimum = MINIMUM_HOST_VERSION.get(resolves_to)
+        version_supported = version >= minimum if version is not None and minimum is not None else None
         efforts: list[str] | None = None
-        if documented and (seen is None or seen["resolves_to"] == documented["resolves_to"]):
-            efforts = [e for e in documented["efforts"] if e in allowed_efforts]
+        if capabilities is not None:
+            efforts = [e for e in capabilities["efforts"] if e in allowed_efforts] if version_supported is not False else []
+        resolution_source = "unknown"
+        if pinned:
+            resolution_source = "host_alias_pin"
+        elif documented_id and host_version:
+            resolution_source = "documented_version_table"
+        elif documented_id:
+            resolution_source = "cached_host_version"
+        elif seen:
+            resolution_source = "observed_subagent_telemetry"
         models.append({
             "slug": alias,
             "resolves_to": resolves_to,
-            "resolution_source": "observed_subagent_telemetry" if seen else (
-                "documented_table" if documented else "unknown"),
+            "resolution_source": resolution_source,
+            "last_observed_model": (seen or {}).get("resolves_to"),
+            "observed_at": (seen or {}).get("observed_at"),
+            "observed_differs_from_reference": bool(seen and seen["resolves_to"] != resolves_to),
+            "tool_effort_levels": sorted(set(enum.get("efforts", []))),
+            "minimum_host_version": ".".join(map(str, minimum)) if minimum else None,
+            "host_version_supported": version_supported,
             "supported_reasoning_levels": efforts,  # None = unknown, never guessed
-            "default_effort": (documented or {}).get("default_effort") if efforts else None,
-            "context": (documented or {}).get("context"),
+            "default_effort": (capabilities or {}).get("default_effort"),
+            "api_default_effort": (capabilities or {}).get("api_default_effort"),
+            "context": "200k host limit" if capabilities and env.get("CLAUDE_CODE_DISABLE_1M_CONTEXT") == "1"
+                       else (capabilities or {}).get("context"),
+            "fast_supported": (capabilities or {}).get("fast_supported"),
+            "capability_source": "documented_model_id" if capabilities else "unknown",
         })
     return models
 
 
-def catalog_sets(models: list[dict[str, Any]]) -> dict[str, set[str]]:
+def catalog_sets(models: list[dict[str, Any]], tool_efforts: tuple[str, ...] | list[str] = EFFORT_LEVELS) -> dict[str, set[str]]:
     """Model -> selectable efforts, including the explicit ``inherit`` choices."""
-    result: dict[str, set[str]] = {INHERIT: set(EFFORT_LEVELS) | {INHERIT}}
+    result: dict[str, set[str]] = {INHERIT: (set(tool_efforts) & set(EFFORT_LEVELS)) | {INHERIT}}
     for item in models:
+        if item.get("host_version_supported") is False:
+            continue
         levels = item["supported_reasoning_levels"]
         result[item["slug"]] = (set(levels) if levels else set()) | {INHERIT}
     return result
 
 
-def _fingerprint(models: list[dict[str, Any]]) -> str:
+def _fingerprint(models: list[dict[str, Any]], tool_efforts: list[str]) -> str:
     core = [{"slug": m["slug"], "resolves_to": m["resolves_to"],
-             "levels": m["supported_reasoning_levels"]} for m in models]
-    return hashlib.sha256(json.dumps(core, sort_keys=True).encode()).hexdigest()
+             "levels": m["supported_reasoning_levels"], "tool_efforts": m.get("tool_effort_levels"),
+             "observed_model": m.get("last_observed_model")} for m in models]
+    semantic = {"models": sorted(core, key=lambda m: m["slug"]), "tool_efforts": sorted(set(tool_efforts))}
+    return hashlib.sha256(json.dumps(semantic, sort_keys=True).encode()).hexdigest()
+
+
+def _model_changed(before: Mapping[str, Any], after: Mapping[str, Any]) -> bool:
+    if any(before.get(key) != after.get(key) for key in ("resolves_to", "supported_reasoning_levels")):
+        return True
+    # Fields added by this version start a tracking baseline for old snapshots.
+    return any(key in before and before[key] != after.get(key)
+               for key in ("tool_effort_levels", "last_observed_model"))
 
 
 def _changes(old: list[dict[str, Any]], new: list[dict[str, Any]]) -> dict[str, Any]:
@@ -261,32 +344,41 @@ def _changes(old: list[dict[str, Any]], new: list[dict[str, Any]]) -> dict[str, 
             {"slug": s,
              "previous_resolves_to": before[s].get("resolves_to"), "resolves_to": after[s].get("resolves_to"),
              "previous_reasoning_levels": before[s].get("supported_reasoning_levels"),
-             "supported_reasoning_levels": after[s].get("supported_reasoning_levels")}
+             "supported_reasoning_levels": after[s].get("supported_reasoning_levels"),
+             "previous_tool_efforts": before[s].get("tool_effort_levels"),
+             "tool_efforts": after[s].get("tool_effort_levels"),
+             "previous_observed_model": before[s].get("last_observed_model"),
+             "last_observed_model": after[s].get("last_observed_model")}
             for s in sorted(before.keys() & after.keys())
-            if (before[s].get("resolves_to"), before[s].get("supported_reasoning_levels"))
-            != (after[s].get("resolves_to"), after[s].get("supported_reasoning_levels"))
+            if _model_changed(before[s], after[s])
         ],
     }
 
 
-def check_catalog(state_dir: Path, models: list[dict[str, Any]]) -> dict[str, Any]:
+def check_catalog(state_dir: Path, models: list[dict[str, Any]], tool_efforts: list[str]) -> dict[str, Any]:
     path = state_dir / "catalog_state.json"
-    fingerprint = _fingerprint(models)
+    tool_efforts = sorted(set(tool_efforts))
+    fingerprint = _fingerprint(models, tool_efforts)
     if not path.exists():
         commit_files({path: _dump({"version": CATALOG_STATE_VERSION, "last_seen_fingerprint": fingerprint,
-                                   "last_seen_models": models, "acknowledged": {}, "pending": []})}, state_dir)
+                                   "last_seen_models": models, "last_seen_efforts": tool_efforts,
+                                   "acknowledged": {}, "pending": []})}, state_dir)
         return {"status": "baseline_established", "fingerprint": fingerprint, "pending": []}
     state = _read_json(path, "catalog state")
     if not isinstance(state, dict) or state.get("version") != CATALOG_STATE_VERSION:
         raise AdapterError(f"invalid catalog state; refusing to reset it: {path}")
     if fingerprint != state["last_seen_fingerprint"]:
         known = {item.get("fingerprint") for item in state["pending"]}
-        if fingerprint not in state["acknowledged"] and fingerprint not in known:
+        changes = _changes(state["last_seen_models"], models)
+        if "last_seen_efforts" in state and state["last_seen_efforts"] != tool_efforts:
+            changes["dispatch_efforts"] = {"previous": state["last_seen_efforts"], "current": tool_efforts}
+        if any(changes.values()) and fingerprint not in state["acknowledged"] and fingerprint not in known:
             state["pending"].append({"fingerprint": fingerprint,
                                      "previous_fingerprint": state["last_seen_fingerprint"],
-                                     "changes": _changes(state["last_seen_models"], models)})
+                                     "changes": changes})
         state["last_seen_fingerprint"] = fingerprint
         state["last_seen_models"] = models
+        state["last_seen_efforts"] = tool_efforts
         commit_files({path: _dump(state)}, state_dir)
     notice: dict[str, Any] = {"status": "pending_change" if state["pending"] else "unchanged",
                               "fingerprint": fingerprint, "pending": state["pending"]}
@@ -604,14 +696,23 @@ def resolve_role(requested: str, claude_home: Path, loaded: set[str] | None) -> 
 
 # ---------------------------------------------------------------- commands
 
-def cmd_models(state_dir: Path, claude_home: Path, models: list[dict[str, Any]]) -> int:
+def validate_activation(role: str, choice: Mapping[str, str], catalog: Mapping[str, set[str]]) -> None:
+    if choice["model"] not in catalog or choice["effort"] not in catalog[choice["model"]]:
+        raise AdapterError(f"{role}: activation {choice['model']}/{choice['effort']} is not supported by the current catalog")
+
+
+def unavailable_saved_choices(profile: Mapping[str, Any], catalog: Mapping[str, set[str]]) -> list[dict[str, str]]:
+    return [{"role": role, "model": choice["model"], "effort": choice["effort"]}
+            for role, cfg in profile["roles"].items() for choice in (cfg, *cfg["fallbacks"])
+            if choice["model"] not in catalog or choice["effort"] not in catalog[choice["model"]]]
+
+def cmd_models(state_dir: Path, claude_home: Path, models: list[dict[str, Any]], enum: Mapping[str, Any]) -> int:
     profile_exists = _profile_path(state_dir).exists()
     roles = _raw_roles(state_dir)
     try:
         profile = load_profile(state_dir, None) if profile_exists else None
     except AdapterError:
         profile = None
-    enum = dispatch_enum(state_dir)
     emit({
         "status": "ok",
         "models": models,
@@ -624,7 +725,11 @@ def cmd_models(state_dir: Path, claude_home: Path, models: list[dict[str, Any]])
             "existing_configuration": profile_exists,
             "current_roles": roles,
             "unconfigured_roles": [r for r in ROLE_NAMES if not roles or r not in roles],
-            "selectable_models": [m["slug"] for m in models] + [INHERIT],
+            "selectable_models": ([m["slug"] for m in models if m["host_version_supported"] is not False]
+                                  if enum["models_current"] else []) + [INHERIT],
+            "selection_ready": not enum["refresh_required"],
+            "refresh_command": "models --host-version <RUNNING host version> --dispatch-models <CURRENT Agent model enum> --dispatch-efforts <CURRENT effort enum>",
+            "effort_when_model_changes": "host_model_default_unless_explicit",
             "card_order": "per role: model, then that model's effort, then fallback card",
             "unset_optional_settings": "preserve_host_defaults_without_prompting",
         },
@@ -640,7 +745,11 @@ def cmd_models(state_dir: Path, claude_home: Path, models: list[dict[str, Any]])
     return 0
 
 
-def cmd_sync(profile_file: Path, state_dir: Path, claude_home: Path, catalog: dict[str, set[str]]) -> int:
+def cmd_sync(profile_file: Path, state_dir: Path, claude_home: Path, catalog: dict[str, set[str]],
+             enum: Mapping[str, Any]) -> int:
+    if enum["refresh_required"]:
+        raise AdapterError("sync requires CURRENT --dispatch-models, --dispatch-efforts and --host-version; "
+                           "cached or documented examples cannot authorize model selections")
     profile = normalize_profile(complete_profile(_read_json(profile_file, "profile")), catalog)
     outputs = {_profile_path(state_dir): serialize_profile(profile)}
     outputs.update(host_outputs(state_dir, claude_home, profile))
@@ -654,7 +763,7 @@ def cmd_sync(profile_file: Path, state_dir: Path, claude_home: Path, catalog: di
 
 
 def cmd_resolve(role: str, state_dir: Path, claude_home: Path, catalog: dict[str, set[str]],
-                loaded: set[str] | None) -> int:
+                loaded: set[str] | None, models: list[dict[str, Any]]) -> int:
     profile = load_profile(state_dir, None)
     resolved = resolve_role(role, claude_home, loaded)
     choice = active_choice(profile["roles"][resolved["role"]])
@@ -666,6 +775,10 @@ def cmd_resolve(role: str, state_dir: Path, claude_home: Path, catalog: dict[str
         # documented: keep dispatching the user's choice, surface it for the card.
         warnings.append({"level": "warning", "code": "choice_not_confirmed_by_current_catalog",
                          "detail": f"{choice['model']}/{choice['effort']}; Claude Code lowers unsupported levels"})
+    if any(m["slug"] == choice["model"] and m["observed_differs_from_reference"] for m in models):
+        warnings.append({"level": "warning", "code": "historical_model_differs_from_reference",
+                         "detail": "historical telemetry differs from the configured/version reference; "
+                                   "neither proves this dispatch, verify a fresh probe"})
     if resolved.get("host_override"):
         warnings.append({"level": "info", "code": "agent_file_has_model_or_effort",
                          "detail": "per-invocation parameters take precedence over it"})
@@ -834,11 +947,13 @@ def cmd_failover(role_arg: str, reason_arg: str, event_id: str, state_dir: Path,
     else:
         updated = json.loads(json.dumps(profile))
         updated["roles"][role]["active_index"] += 1
-        updated = normalize_profile(updated, catalog)
+        updated = normalize_profile(updated, None)
         choice = active_choice(updated["roles"][role])
+        validate_activation(role, choice, catalog)
         result = {"status": "failed_over", "role": role, "reason": reason,
                   "previous_model": active["model"], "active_model": choice["model"],
                   "active_effort": choice["effort"], "active_index": updated["roles"][role]["active_index"]}
+        result["unavailable_saved_choices"] = unavailable_saved_choices(updated, catalog)
         outputs[_profile_path(state_dir)] = serialize_profile(updated)
         outputs.update(host_outputs(state_dir, claude_home, updated))
         cooldowns = _cooldowns(state_dir)
@@ -965,13 +1080,14 @@ def cmd_recover(role_arg: str, force: bool, state_dir: Path, claude_home: Path,
         if role not in status:
             continue
         if force or status[role]["primary_recoverable"]:
+            validate_activation(role, profile["roles"][role], catalog)
             updated["roles"][role]["active_index"] = 0
             restored.append(role)
         else:
             waiting[role] = status[role]["cooldown_until"]
     outputs: dict[Path, bytes] = {}
     if restored:
-        updated = normalize_profile(updated, catalog)
+        updated = normalize_profile(updated, None)
         cooldowns = _cooldowns(state_dir)
         for role in restored:
             cooldowns.pop(role, None)
@@ -979,7 +1095,8 @@ def cmd_recover(role_arg: str, force: bool, state_dir: Path, claude_home: Path,
         outputs[state_dir / "cooldowns.json"] = _dump(cooldowns)
         outputs.update(host_outputs(state_dir, claude_home, updated))
     backups = commit_files(outputs, state_dir) if outputs else []
-    emit({"status": "ok", "restored_to_primary": restored, "still_cooling": waiting, "backup_files": backups})
+    emit({"status": "ok", "restored_to_primary": restored, "still_cooling": waiting, "backup_files": backups,
+          "unavailable_saved_choices": unavailable_saved_choices(updated, catalog)})
     return 0
 
 
@@ -1144,13 +1261,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser = JsonArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--claude-home", default=default_home)
     parser.add_argument("--state-dir", default=str(Path.home() / ".team-agent" / "claude-code"))
-    parser.add_argument("--provider", default="anthropic", choices=["anthropic", "other"],
-                        help="alias table is only documented for the Anthropic API provider")
+    parser.add_argument("--provider", default="auto", choices=["auto", "anthropic", "other"],
+                        help="auto detects non-Anthropic routing; override only after confirming the provider")
     sub = parser.add_subparsers(dest="command", required=True)
     for name in ("models", "onboarding"):
-        p = sub.add_parser(name)
-        p.add_argument("--dispatch-models", help="model enum of the current Agent tool, comma-separated")
-        p.add_argument("--dispatch-efforts", help="effort enum of the current Agent tool, comma-separated")
+        sub.add_parser(name)
     sub.add_parser("sync").add_argument("--profile", required=True)
     for name in ("resolve", "verify"):
         p = sub.add_parser(name)
@@ -1183,29 +1298,45 @@ def build_parser() -> argparse.ArgumentParser:
     mode.add_argument("--prepare", type=Path)
     mode.add_argument("--check", type=Path)
     p.add_argument("--loaded-agent-types")
+    for command_parser in sub.choices.values():
+        command_parser.add_argument("--dispatch-models", help="CURRENT Agent tool model enum, comma-separated")
+        command_parser.add_argument("--dispatch-efforts", help="CURRENT Agent tool effort enum; empty means unsupported")
+        command_parser.add_argument("--host-version", help="version of the host running this session, not another PATH binary")
     return parser
 
 
 def run(args: argparse.Namespace, state_dir: Path, claude_home: Path) -> int:
-    global CATALOG_NOTICE
-    if args.command in ("models", "onboarding") and (args.dispatch_models or args.dispatch_efforts):
-        current = dispatch_enum(state_dir)
-        commit_files({_dispatch_path(state_dir): _dump({
-            "models": _csv(args.dispatch_models) or current["models"],
-            "efforts": _csv(args.dispatch_efforts) or current["efforts"],
-            "recorded_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})}, state_dir)
-    models = build_catalog(state_dir, claude_home, args.provider)
-    catalog = catalog_sets(models)
+    global CATALOG_NOTICE, DISPATCH_NOTICE
+    CATALOG_NOTICE = None
+    _version_tuple(args.host_version)  # Validate before any state mutation.
+    # A complete current declaration can replace a broken optional snapshot.
+    complete = args.dispatch_models is not None and args.dispatch_efforts is not None and args.host_version is not None
+    enum = {} if complete else dispatch_enum(state_dir)
+    if args.dispatch_models is not None or args.dispatch_efforts is not None or args.host_version is not None:
+        snapshot = {
+            "models": _csv(args.dispatch_models) if args.dispatch_models is not None else enum["models"],
+            "efforts": _csv(args.dispatch_efforts) if args.dispatch_efforts is not None else enum["efforts"],
+            "host_version": args.host_version or enum.get("host_version"),
+            "recorded_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+        commit_files({_dispatch_path(state_dir): _dump(snapshot)}, state_dir)
+        enum = {**snapshot, "source": "current_dispatch_tool" if args.dispatch_models is not None else enum["source"],
+                "models_current": args.dispatch_models is not None,
+                "efforts_current": args.dispatch_efforts is not None,
+                "refresh_required": not complete}
+    DISPATCH_NOTICE = {key: enum[key] for key in ("source", "models_current", "efforts_current", "refresh_required")}
+    DISPATCH_NOTICE["host_version"] = args.host_version
+    models = build_catalog(state_dir, claude_home, args.provider, enum, args.host_version)
+    catalog = catalog_sets(models, enum["efforts"])
     if args.command not in ("preference", "catalog-ack"):
-        CATALOG_NOTICE = check_catalog(state_dir, models)
+        CATALOG_NOTICE = check_catalog(state_dir, models, enum["efforts"])
     loaded = {t.casefold() for t in _csv(getattr(args, "loaded_agent_types", None)) or []} \
         if getattr(args, "loaded_agent_types", None) is not None else None
     if args.command in ("models", "onboarding"):
-        return cmd_models(state_dir, claude_home, models)
+        return cmd_models(state_dir, claude_home, models, enum)
     if args.command == "sync":
-        return cmd_sync(Path(args.profile).expanduser(), state_dir, claude_home, catalog)
+        return cmd_sync(Path(args.profile).expanduser(), state_dir, claude_home, catalog, enum)
     if args.command == "resolve":
-        return cmd_resolve(args.role, state_dir, claude_home, catalog, loaded)
+        return cmd_resolve(args.role, state_dir, claude_home, catalog, loaded, models)
     if args.command == "verify":
         return cmd_verify(state_dir, claude_home, catalog, loaded)
     if args.command == "preference":

@@ -4,12 +4,12 @@ description: 让子代理按职能使用用户指定的模型、思考强度与�
 license: MIT
 compatibility: 依赖宿主的子代理能力，按宿主分别适配（适配卡在references/adapters，通用判定法在generic.md，删除任一宿主卡不影响其他宿主）。已实测Claude Code（Linux云端与Windows桌面）、Codex（Windows桌面）与Antigravity（Windows桌面）；Qoder、CodeBuddy核对过本机文件；Gemini CLI、Cursor、Copilot、OpenCode仅依据文档；Kimi Code不支持子代理单独设模型。脚本为可选加速器，需Python 3.10+标准库（Codex与Claude Code适配器需3.11+），没有Python时按卡手工写入。因产品本身就是宿主适配，校验时不使用--universal。
 metadata:
-  version: "3.5.1"
+  version: "4.0.0"
 ---
 
 # Team Agent
 
-几乎所有带子代理的Agent都有同一个问题：主代理派发子代理时，默认把自己的模型和思考强度原样给子代理。本技能让用户按职能指定“哪个模型、什么强度、用完额度后依次换谁”，并把选择落到当前宿主真正会执行的位置上。
+子代理的默认模型与思考强度由宿主、角色和会话共同决定，不一定符合用户的分工。本技能让用户按职能指定“哪个模型、什么强度、用完额度后依次换谁”，并把选择落到当前宿主真正会执行的位置上。
 
 ## 执行原则
 
@@ -34,6 +34,7 @@ metadata:
 - 状态目录：`~/.team-agent/<宿主ID>/`（Codex沿用历史位置 `~/.team-agent/`）。其中 `profile.json` 是该宿主的职能配置；不同宿主的模型ID不通用，不互相复制。
 - 按适配卡读取：当前可派发的模型与档位、已有角色文件、会覆盖选择的环境变量或设置、已安装的受管内容。
 - 读取失败不当作“没有配置”，不覆盖旧值；目录读取失败不当作模型下架。
+- 保存的工具枚举只作历史记录。生成选择卡前重新读取当前派发工具，不能把旧快照或官方示例当成当前可调用清单。
 
 ## 4. 选择卡
 
